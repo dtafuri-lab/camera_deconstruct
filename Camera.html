@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fotocamera selettiva</title>
+  <style>
+    :root { --accent:#111; --ok:#1ea672; --warn:#d9534f; }
+    body { margin:0; font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica; background:#fafafa; color:#111; }
+    header { padding:12px 16px; border-bottom:1px solid #ddd; }
+    main { display:grid; gap:12px; padding:12px; }
+    video, canvas { width:100%; max-width:420px; border-radius:8px; background:#000; }
+    .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+    label { display:inline-flex; align-items:center; gap:6px; }
+    input[type="range"] { width:160px; }
+    button { padding:10px 14px; border:1px solid #222; background:#fff; border-radius:8px; cursor:pointer; }
+    button[disabled] { opacity:.4; cursor:not-allowed; }
+    .status { font-size:13px; color:#555; }
+    .chip { padding:4px 8px; border-radius:12px; background:#eee; }
+    .chip.ok { background:#cfeadb; color:#0f5132; }
+    .chip.no { background:#f5d3d1; color:#842029; }
+    .out { display:grid; gap:8px; }
+    img.output { width:100%; max-width:420px; background:conic-gradient(from 180deg at 50% 50%, #fff 0 25%, #f7f7f7 25% 50%, #fff 50% 75%, #f7f7f7 75% 100%); border:1px dashed #bbb; border-radius:8px; }
+  </style>
+</head>
+<body>
+<header>
+  <strong>Fotocamera selettiva</strong> — lo scatto accade solo sotto condizione
+</header>
+
+<main>
+  <video id="v" playsinline autoplay muted></video>
+  <canvas id="frame" width="640" height="480" hidden></canvas>
+
+  <div class="row">
+    <label>
+      <span>Modalità:</span>
+      <select id="mode">
+        <option value="color">Soglia colore</option>
+        <option value="gesture">Gesto (accelerazione)</option>
+      </select>
+    </label>
+    <label id="colorControls">
+      <span>Tonalità (H):</span>
+      <input id="hue" type="range" min="0" max="360" value="200" />
+      <span id="hueVal" class="chip">200°</span>
+    </label>
+    <label id="tolControls">
+      <span>Tolleranza:</span>
+      <input id="tol" type="range" min="2" max="40" value="12" />
+      <span id="tolVal" class="chip">±12</span>
+    </label>
+    <label id="pctControls">
+      <span>Percentuale minima:</span>
+      <input id="pct" type="range" min="5" max="80" value="35" />
+      <span id="pctVal" class="chip">35%</span>
+    </label>
+    <label id="gestControls" style="display:none;">
+      <span>Soglia gesto:</span>
+      <input id="gth" type="range" min="10" max="30" value="18" />
+      <span id="gthVal" class="chip">18</span>
+    </label>
+  </div>
+
+  <div class="row">
+    <button id="shoot" disabled>Scatta (PNG circolare)</button>
+    <span id="gate" class="chip no">Bloccato</span>
+    <span id="status" class="status">Avvio…</span>
+  </div>
+
+  <div class="out">
+    <img id="out" class="output" alt="Output PNG" />
+  </div>
+</main>
+
+<script>
+const v = document.getElementById('v');
+const frame = document.getElementById('frame');
+const ctx = frame.getContext('2d', { willReadFrequently: true });
+const shoot = document.getElementById('shoot');
+const gateChip = document.getElementById('gate');
+const statusEl = document.getElementById('status');
+
+const modeSel = document.getElementById('mode');
+const hue = document.getElementById('hue');
+const tol = document.getElementById('tol');
+const pct = document.getElementById('pct');
+const gth = document.getElementById('gth');
+const hueVal = document.getElementById('hueVal');
+const tolVal = document.getElementById('tolVal');
+const pctVal = document.getElementById('pctVal');
+const gthVal = document.getElementById('gthVal');
+
+const colorControls = document.getElementById('colorControls');
+const tolControls = document.getElementById('tolControls');
+const pctControls = document.getElementById('pctControls');
+const gestControls = document.getElementById('gestControls');
+
+const outImg = document.getElementById('out');
+
+let stream, gatingOK = false;
+let lastGestureTime = 0;
+
+function rgbToHue(r,g,b){
+  r/=255; g/=255; b/=255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b);
+  let h, d = max - min;
+  if (d === 0) h = 0;
+  else if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h = Math.round(h * 60);
+  if (h < 0) h += 360;
+  return h;
+}
+
+function percentHue(imageData, targetHue, tolerance){
+  const d = imageData.data; let hit = 0, px = d.length/4;
+  for (let i=0; i<d.length; i+=4){
+    const h = rgbToHue(d[i], d[i+1], d[i+2]);
+    const diff = Math.min(Math.abs(h - targetHue), Math.abs(h - targetHue + 360), Math.abs(h - targetHue - 360));
+    if (diff <= tolerance) hit++;
+  }
+  return (hit / px) * 100;
+}
+
+function updateUI(){
+  gateChip.textContent = gatingOK ? 'Sbloccato' : 'Bloccato';
+  gateChip.className = 'chip ' + (gatingOK ? 'ok' : 'no');
+  shoot.disabled = !gatingOK;
+}
+
+async function start(){
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    v.srcObject = stream;
+    statusEl.textContent = 'Camera attiva. Tocca per permettere motion su iOS.';
+    analyzeLoop();
+    setupMotion();
+  } catch (e){
+    statusEl.textContent = 'Permesso negato o camera indisponibile.';
+    console.error(e);
+  }
+}
+
+function analyzeLoop(){
+  if (v.readyState >= 2){
+    const w = frame.width, h = frame.height;
+    ctx.drawImage(v, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h);
+    const m = modeSel.value;
+    if (m === 'color'){
+      const p = percentHue(data, Number(hue.value), Number(tol.value));
+      gatingOK = p >= Number(pct.value);
+      statusEl.textContent = `Dominanza H≈${hue.value}°: ${p.toFixed(1)}% (min ${pct.value}%)`;
+    } else {
+      const since = (performance.now() - lastGestureTime) / 1000;
+      gatingOK = since >= 0 && since <= 0.8; // finestra breve dopo gesto
+      statusEl.textContent = gatingOK ? 'Gesto rilevato: scatta ora' : 'In attesa di gesto…';
+    }
+    updateUI();
+  }
+  requestAnimationFrame(analyzeLoop);
+}
+
+function setupMotion(){
+  function onMotion(e){
+    const a = e.accelerationIncludingGravity || e.acceleration || {x:0,y:0,z:0};
+    const mag = Math.sqrt((a.x||0)**2 + (a.y||0)**2 + (a.z||0)**2);
+    if (mag > Number(gth.value)){
+      lastGestureTime = performance.now();
+    }
+  }
+  window.addEventListener('devicemotion', onMotion, { passive: true });
+  // iOS needs a tap to enable motion
+  document.body.addEventListener('click', async ()=>{
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+      try { await DeviceMotionEvent.requestPermission(); statusEl.textContent = 'Motion abilitato.'; } catch {}
+    }
+  }, { once:true });
+}
+
+function drawMaskedToCanvas(srcCanvas){
+  const w = srcCanvas.width, h = srcCanvas.height;
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d');
+  octx.clearRect(0,0,w,h);
+  octx.save();
+  const r = Math.min(w,h)/2 - 8;
+  octx.beginPath();
+  octx.arc(w/2, h/2, r, 0, Math.PI*2);
+  octx.clip();
+  octx.drawImage(srcCanvas, 0, 0, w, h);
+  octx.restore();
+  return out;
+}
+
+function capture(){
+  const masked = drawMaskedToCanvas(frame);
+  const png = masked.toDataURL('image/png');
+  outImg.src = png;
+  // auto-download for desktop; on mobile shows preview and save action via long-press
+  const a = document.createElement('a');
+  a.href = png; a.download = 'scatto_selettivo.png';
+  a.click();
+}
+
+hue.addEventListener('input', ()=>{ hueVal.textContent = `${hue.value}°`; });
+tol.addEventListener('input', ()=>{ tolVal.textContent = `±${tol.value}`; });
+pct.addEventListener('input', ()=>{ pctVal.textContent = `${pct.value}%`; });
+gth.addEventListener('input', ()=>{ gthVal.textContent = `${gth.value}`; });
+
+modeSel.addEventListener('change', ()=>{
+  const isColor = modeSel.value === 'color';
+  colorControls.style.display = isColor ? '' : 'none';
+  tolControls.style.display   = isColor ? '' : 'none';
+  pctControls.style.display   = isColor ? '' : 'none';
+  gestControls.style.display  = isColor ? 'none' : '';
+});
+
+shoot.addEventListener('click', capture);
+
+start();
+</script>
+</body>
+</html>
